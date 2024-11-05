@@ -47,6 +47,20 @@
         }                                                                   \
     } while (0)
 
+// the type BSTR_LIT is intended to clarify that this is not the same as a BSTR
+// it is a pointer to static data (while a BSTR is allocated using COM memory allocation functions)
+typedef WCHAR* BSTR_LIT;
+
+#define MAKE_BSTR_LIT(varname_, str_)                                                                         \
+    BSTR_LIT varname_;                                                                                        \
+    do {                                                                                                      \
+        static struct {                                                                                       \
+            DWORD n_bytes;                                                                                    \
+            WCHAR data[((sizeof(str_) + sizeof(DWORD) - 1) / sizeof(DWORD)) * sizeof(DWORD) / sizeof(WCHAR)]; \
+        } _bstr_lit_container_##varname_ = {sizeof(str_) - sizeof(WCHAR), str_};                              \
+        varname_ = &*_bstr_lit_container_##varname_.data;                                                     \
+    } while (0)
+
 static void print_stdout(const char* str, size_t len)
 {
     WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), str, (DWORD)len, NULL, NULL);
@@ -78,13 +92,13 @@ static HRESULT update_light_mode(DWORD light)
     return 0;
 }
 
-static HRESULT add_daily_trigger(ITriggerCollection* pTriggerCollection, const SYSTEMTIME* p_time)
+static HRESULT add_daily_trigger(ITriggerCollection* pTriggerCollection, const SYSTEMTIME* p_time, const BSTR_LIT time_limit)
 {
     ITrigger* pTrigger = NULL;
     IFR(pTriggerCollection->lpVtbl->Create(pTriggerCollection, TASK_TRIGGER_DAILY, &pTrigger));
     IDailyTrigger* pDailyTrigger = NULL;
     IFR(pTrigger->lpVtbl->QueryInterface(pTrigger, &IID_IDailyTrigger, (void**)&pDailyTrigger));
-    IFR_PUT_BSTR(pDailyTrigger, put_ExecutionTimeLimit, L"PT1M");
+    IFR(pDailyTrigger->lpVtbl->put_ExecutionTimeLimit(pDailyTrigger, time_limit));
     wchar_t time_buffer[20];
     time_to_string(time_buffer, ARRAYSIZE(time_buffer), p_time);
     IFR_PUT_BSTR(pDailyTrigger, put_StartBoundary, time_buffer);
@@ -135,7 +149,8 @@ static HRESULT register_schtask(const SYSTEMTIME* p_sunrise, const SYSTEMTIME* p
     IFR(pTriggerCollection->lpVtbl->Create(pTriggerCollection, TASK_TRIGGER_LOGON, &pTriggerLogon));
     ILogonTrigger* pLogonTrigger = NULL;
     IFR(pTriggerLogon->lpVtbl->QueryInterface(pTriggerLogon, &IID_ILogonTrigger, (void**)&pLogonTrigger));
-    IFR_PUT_BSTR(pLogonTrigger, put_ExecutionTimeLimit, L"PT1M");
+    MAKE_BSTR_LIT(time_limit, L"PT1M");
+    IFR(pTriggerLogon->lpVtbl->put_ExecutionTimeLimit(pTriggerLogon, time_limit));
     IFR_PUT_BSTR(pLogonTrigger, put_UserId, user_id);
 
     //  Add an event trigger to the task that fires when the computer resumes from hibernation mode.
@@ -143,13 +158,14 @@ static HRESULT register_schtask(const SYSTEMTIME* p_sunrise, const SYSTEMTIME* p
     IFR(pTriggerCollection->lpVtbl->Create(pTriggerCollection, TASK_TRIGGER_EVENT, &pTriggerEvent));
     IEventTrigger* pEventTrigger = NULL;
     IFR(pTriggerEvent->lpVtbl->QueryInterface(pTriggerEvent, &IID_IEventTrigger, (void**)&pEventTrigger));
-    IFR_PUT_BSTR(pEventTrigger, put_Subscription, L"<QueryList><Query Id=\"0\" Path=\"System\"><Select Path=\"System\">*[System[Provider[@Name='Microsoft-Windows-Power-Troubleshooter'] and (Level=4 or Level=0) and (EventID=1)]]</Select></Query></QueryList>");
+    MAKE_BSTR_LIT(event_query, L"<QueryList><Query Id=\"0\" Path=\"System\"><Select Path=\"System\">*[System[Provider[@Name='Microsoft-Windows-Power-Troubleshooter'] and (Level=4 or Level=0) and (EventID=1)]]</Select></Query></QueryList>");
+    IFR(pEventTrigger->lpVtbl->put_Subscription(pEventTrigger, event_query));
 
     //  Add the sunrise trigger to the task.
-    IFR(add_daily_trigger(pTriggerCollection, p_sunrise));
+    IFR(add_daily_trigger(pTriggerCollection, p_sunrise, time_limit));
 
     //  Add the sunset trigger to the task.
-    IFR(add_daily_trigger(pTriggerCollection, p_sunset));
+    IFR(add_daily_trigger(pTriggerCollection, p_sunset, time_limit));
 
     // Add an action to the task.
     IActionCollection* pActionCollection = NULL;
@@ -167,26 +183,12 @@ static HRESULT register_schtask(const SYSTEMTIME* p_sunrise, const SYSTEMTIME* p
     IFR_PUT_BSTR(pExecAction, put_Arguments, action_args);
 
     // Save the task in the root folder.
-    BSTR bstr_root_folder = SysAllocString(L"\\");
-    if (!bstr_root_folder) {
-        return E_OUTOFMEMORY;
-    }
+    MAKE_BSTR_LIT(root_folder, L"\\");
     ITaskFolder* pRootFolder = NULL;
-    HRESULT hr_get_folder = pService->lpVtbl->GetFolder(pService, bstr_root_folder, &pRootFolder);
-    SysFreeString(bstr_root_folder);
-    if (FAILED(hr_get_folder)) {
-        return hr_get_folder;
-    }
-    BSTR bstr_task_name = SysAllocString(L"Dark Mode Switcher");
-    if (!bstr_task_name) {
-        return E_OUTOFMEMORY;
-    }
+    IFR(pService->lpVtbl->GetFolder(pService, root_folder, &pRootFolder));
+    MAKE_BSTR_LIT(task_name, L"Dark Mode Switcher");
     IRegisteredTask* pRegisteredTask = NULL;
-    HRESULT hr_register = pRootFolder->lpVtbl->RegisterTaskDefinition(pRootFolder, bstr_task_name, pTask, TASK_CREATE_OR_UPDATE, (VARIANT){0}, (VARIANT){0}, TASK_LOGON_INTERACTIVE_TOKEN, (VARIANT){0}, &pRegisteredTask);
-    SysFreeString(bstr_task_name);
-    if (FAILED(hr_register)) {
-        return hr_register;
-    }
+    IFR(pRootFolder->lpVtbl->RegisterTaskDefinition(pRootFolder, task_name, pTask, TASK_CREATE_OR_UPDATE, (VARIANT){0}, (VARIANT){0}, TASK_LOGON_INTERACTIVE_TOKEN, (VARIANT){0}, &pRegisteredTask));
 
     return 0;
 }
